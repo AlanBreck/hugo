@@ -19,6 +19,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+  "runtime/pprof"
 
 	"github.com/bep/logg"
 	"github.com/gohugoio/hugo/common/herrors"
@@ -80,7 +81,7 @@ func (s *Site) renderPages(ctx *siteRenderContext) error {
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go pageRenderer(ctx, s, pages, results, wg)
+		go pageRenderer(context.Background(), s, pages, results, wg)
 	}
 
 	cfg := ctx.cfg
@@ -120,7 +121,7 @@ func (s *Site) renderPages(ctx *siteRenderContext) error {
 }
 
 func pageRenderer(
-	ctx *siteRenderContext,
+	ctx context.Context,
 	s *Site,
 	pages <-chan *pageState,
 	results chan<- error,
@@ -129,64 +130,77 @@ func pageRenderer(
 	defer wg.Done()
 
 	for p := range pages {
-		if p.m.isStandalone() && !ctx.shouldRenderStandalonePage(p.Kind()) {
-			continue
-		}
+    targetPath := p.targetPaths().TargetFilename
+		// Add labels for pprof profiler to localise the cause of load.
+		labels := pprof.Labels(
+			"target_filename", targetPath,
+			"layout", p.Layout(),
+			"kind", p.Kind(),
+			"section", p.Section())
 
-		if p.m.pageConfig.Build.PublishResources {
-			if err := p.renderResources(); err != nil {
-				s.SendError(p.errorf(err, "failed to render page resources"))
-				continue
-			}
-		}
+		pprof.Do(ctx, labels, func(ctx context.Context) {
+      if p.m.isStandalone() && !ctx.shouldRenderStandalonePage(p.Kind()) {
+        return
+      }
 
-		if !p.render {
-			// Nothing more to do for this page.
-			continue
-		}
+      if p.m.pageConfig.Build.PublishResources {
+        if err := p.renderResources(); err != nil {
+          s.SendError(p.errorf(err, "failed to render page resources"))
+          return
+        }
+      }
 
-		templ, found, err := p.resolveTemplate()
-		if err != nil {
-			s.SendError(p.errorf(err, "failed to resolve template"))
-			continue
-		}
+      if !p.render {
+        // Nothing more to do for this page.
+        return
+      }
 
-		if !found {
-			s.Log.Trace(
-				func() string {
-					return fmt.Sprintf("no layout for kind %q found", p.Kind())
-				},
-			)
-			// Don't emit warning for missing 404 etc. pages.
-			if !p.m.isStandalone() {
-				s.logMissingLayout("", p.Layout(), p.Kind(), p.f.Name)
-			}
-			continue
-		}
+      templ, found, err := p.resolveTemplate()
+      if err != nil {
+        s.SendError(p.errorf(err, "failed to resolve template"))
+        return
+      }
 
-		targetPath := p.targetPaths().TargetFilename
+      if !found {
+        s.Log.Trace(
+          func() string {
+            return fmt.Sprintf("no layout for kind %q found", p.Kind())
+          },
+        )
+        // Don't emit warning for missing 404 etc. pages.
+        if !p.m.isStandalone() {
+          s.logMissingLayout("", p.Layout(), p.Kind(), p.f.Name)
+        }
+        return
+      }
 
-		s.Log.Trace(
-			func() string {
-				return fmt.Sprintf("rendering outputFormat %q kind %q using layout %q to %q", p.pageOutput.f.Name, p.Kind(), templ.Name(), targetPath)
-			},
-		)
+      targetPath := p.targetPaths().TargetFilename
 
-		var d any = p
-		switch p.Kind() {
-		case kinds.KindSitemapIndex:
-			d = s.h.Sites
-		}
+      s.Log.Trace(
+        func() string {
+          return fmt.Sprintf("rendering outputFormat %q kind %q using layout %q to %q", p.pageOutput.f.Name, p.Kind(), templ.Name(), targetPath)
+        },
+      )
 
-		if err := s.renderAndWritePage(&s.PathSpec.ProcessingStats.Pages, "page "+p.Title(), targetPath, p, d, templ); err != nil {
-			results <- err
-		}
+      var d any = p
+      switch p.Kind() {
+      case kinds.KindSitemapIndex:
+        d = s.h.Sites
+      }
 
-		if p.paginator != nil && p.paginator.current != nil {
-			if err := s.renderPaginator(p, templ); err != nil {
-				results <- err
-			}
-		}
+      ctx = pprof.WithLabels(ctx, pprof.Labels("template", templ.Name()))
+			pprof.Do(ctx, labels, func(ctx context.Context) {
+        if err := s.renderAndWritePage(&s.PathSpec.ProcessingStats.Pages, "page "+p.Title(), targetPath, p, d, templ); err != nil {
+          results <- err
+        }
+
+        if p.paginator != nil && p.paginator.current != nil {
+          if err := s.renderPaginator(p, templ); err != nil {
+            results <- err
+          }
+        }
+      })
+    })
 	}
 }
 
